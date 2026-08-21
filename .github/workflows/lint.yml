@@ -1,0 +1,26 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The module scripts run under Android's sh (mksh/ash), not bash.
+      - name: Run ShellCheck
+        run: shellcheck -s sh customize.sh post-fs-data.sh
+
+      - name: Reject CRLF in shipped text files
+        run: |
+          set -euo pipefail
+          bad=$(grep -rlU $'\r' customize.sh post-fs-data.sh system.prop module.prop META-INF || true)
+          if [ -n "$bad" ]; then
+            echo "::error::CRLF line endings would break these on Android:"
+            echo "$bad"
+            exit 1
+          fi

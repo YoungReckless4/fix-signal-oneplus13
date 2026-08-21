@@ -1,0 +1,183 @@
+# Pulls a stock oplusstanvbk.img out of a published OnePlus firmware archive and
+# commits it. Ported from stmtc233/fix-signal-oneplus13's update-module-from-archive.yml,
+# split so that syncing and releasing stay separate steps: the image must be
+# verified on a real device before it is published to users.
+name: Sync firmware image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: Repository hosting the *-image-firmware.7z release assets
+        required: true
+        default: stmtc233/oneplus_archive
+      device_code:
+        description: Device model code used as the asset name prefix
+        required: true
+        default: PJZ110
+      firmware_version:
+        description: Pin an exact firmware version (leave blank for the newest)
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-firmware
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve firmware asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          DEVICE: ${{ inputs.device_code }}
+          PIN: ${{ inputs.firmware_version }}
+        run: |
+          set -euo pipefail
+          curl -sfL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${SOURCE_REPO}/releases?per_page=100" > releases.json
+
+          jq -r --arg dev "$DEVICE" --arg pin "$PIN" '
+            [ .[]
+              | select(.draft == false and .prerelease == false)
+              | . as $r
+              | .assets[]
+              | select(.name | test("^" + $dev + "_.*-image-firmware\.7z$"))
+              | { tag: $r.tag_name,
+                  published: $r.published_at,
+                  name: .name,
+                  url: .browser_download_url,
+                  version: (.name | capture("^" + $dev + "_(?<v>[0-9.]+)-").v) } ]
+            | if $pin == "" then (sort_by(.published) | reverse) else map(select(.version == $pin)) end
+            | .[0] // empty
+          ' releases.json > picked.json
+
+          test -s picked.json || { echo "::error::No firmware asset matched ${DEVICE}"; exit 1; }
+
+          {
+            echo "FIRMWARE_VERSION=$(jq -r .version picked.json)"
+            echo "ASSET_NAME=$(jq -r .name picked.json)"
+            echo "ASSET_URL=$(jq -r .url picked.json)"
+            echo "UPSTREAM_TAG=$(jq -r .tag picked.json)"
+            echo "UPSTREAM_PUBLISHED=$(jq -r .published picked.json)"
+          } >> "$GITHUB_ENV"
+
+      - name: Skip when already current
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -E '^version=' module.prop | cut -d= -f2-)
+          if [ "$CURRENT" = "${FIRMWARE_VERSION}" ]; then
+            echo "Already on ${CURRENT}; nothing to do."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          else
+            echo "SKIP=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download and extract oplusstanvbk.img
+        if: env.SKIP == '0'
+        run: |
+          set -euo pipefail
+          if ! command -v 7z >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq p7zip-full
+          fi
+          mkdir -p work/extracted
+          curl -sfL --retry 3 -o "work/${ASSET_NAME}" "${ASSET_URL}"
+          echo "ARCHIVE_SHA256=$(sha256sum "work/${ASSET_NAME}" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+          7z x -y "work/${ASSET_NAME}" -owork/extracted oplusstanvbk.img > /dev/null
+          image_path="$(find work/extracted -type f -name 'oplusstanvbk.img' -print -quit)"
+          test -n "$image_path" || { echo "::error::oplusstanvbk.img not found in ${ASSET_NAME}"; exit 1; }
+
+          # Every PJZ110 build so far has produced exactly this size; a different
+          # size means the partition layout changed and needs a human look.
+          size=$(stat -c%s "$image_path")
+          if [ "$size" -ne 1110016 ]; then
+            echo "::error::Unexpected oplusstanvbk.img size ${size} (expected 1110016)"
+            exit 1
+          fi
+
+          cp "$image_path" nvbk/oplusstanvbk.img
+          echo "IMAGE_SHA256=$(sha256sum nvbk/oplusstanvbk.img | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Update module metadata
+        if: env.SKIP == '0'
+        run: |
+          set -euo pipefail
+          VERSION_CODE=$(echo "${FIRMWARE_VERSION}" | awk -F. '{ printf("%d%02d%02d%03d", $1, $2, $3, $4) }')
+          echo "VERSION_CODE=${VERSION_CODE}" >> "$GITHUB_ENV"
+
+          sed -i -E "s/^version=.*/version=${FIRMWARE_VERSION}/" module.prop
+          sed -i -E "s/^versionCode=.*/versionCode=${VERSION_CODE}/" module.prop
+          sed -i -E "s|^updateJson=.*|updateJson=https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/update.json|" module.prop
+
+          # Built with jq rather than a heredoc: an indented heredoc terminator
+          # inside a YAML block scalar never closes, and this validates by construction.
+          jq -n             --arg version "${FIRMWARE_VERSION}"             --argjson versionCode "${VERSION_CODE}"             --arg zipUrl "https://github.com/${GITHUB_REPOSITORY}/releases/download/${FIRMWARE_VERSION}/fix-signal-oneplus13-${FIRMWARE_VERSION}.zip"             --arg changelog "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/CHANGELOG.md"             '{version: $version, versionCode: $versionCode, zipUrl: $zipUrl, changelog: $changelog}'             > update.json
+          cat update.json
+
+      - name: Record in changelog
+        if: env.SKIP == '0'
+        run: |
+          set -euo pipefail
+          MARKER='<!-- new entries are inserted directly below this line -->'
+          grep -qF "$MARKER" CHANGELOG.md || { echo "::error::changelog marker missing"; exit 1; }
+
+          entry=$(mktemp)
+          {
+            echo
+            echo "## ${FIRMWARE_VERSION}"
+            echo
+            echo "- \`nvbk/oplusstanvbk.img\` synced from \`${ASSET_NAME}\`"
+            echo "  - source: \`${{ inputs.source_repo }}\` release \`${UPSTREAM_TAG}\` (published ${UPSTREAM_PUBLISHED})"
+            echo "  - image SHA256: \`${IMAGE_SHA256}\`"
+            echo "  - archive SHA256: \`${ARCHIVE_SHA256}\`"
+          } > "$entry"
+
+          # Insert below the marker so the new entry lands under the title, not above
+          # it. awk's index() is a fixed-string search, so the marker needs no escaping.
+          tmp=$(mktemp)
+          awk -v marker="$MARKER" -v entryfile="$entry" '
+            { print }
+            index($0, marker) && !done {
+              while ((getline line < entryfile) > 0) print line
+              close(entryfile)
+              done = 1
+            }
+          ' CHANGELOG.md > "$tmp"
+          mv "$tmp" CHANGELOG.md
+          rm -f "$entry"
+          head -20 CHANGELOG.md
+
+      - name: Commit
+        if: env.SKIP == '0'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nvbk/oplusstanvbk.img module.prop update.json CHANGELOG.md
+          git commit -m "chore: sync ${{ inputs.device_code }} firmware ${FIRMWARE_VERSION}"
+          git push
+
+      - name: Summary
+        if: env.SKIP == '0'
+        run: |
+          {
+            echo "### Synced ${FIRMWARE_VERSION}"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| asset | \`${ASSET_NAME}\` |"
+            echo "| image SHA256 | \`${IMAGE_SHA256}\` |"
+            echo "| versionCode | ${VERSION_CODE} |"
+            echo
+            echo "Verify on a device, then push tag \`${FIRMWARE_VERSION}\` to publish."
+          } >> "$GITHUB_STEP_SUMMARY"

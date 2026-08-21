@@ -1,0 +1,55 @@
+# Publishes the flashable zip. Deliberately separate from the firmware sync so a
+# synced image is only released after it has been checked on a real device.
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches module.prop
+        run: |
+          set -euo pipefail
+          PROP_VERSION=$(grep -E '^version=' module.prop | cut -d= -f2-)
+          if [ "${GITHUB_REF_NAME}" != "${PROP_VERSION}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match module.prop version ${PROP_VERSION}"
+            exit 1
+          fi
+          echo "ID=$(grep -E '^id=' module.prop | cut -d= -f2-)" >> "$GITHUB_ENV"
+
+      - name: Build module zip
+        run: |
+          set -euo pipefail
+          # Same script developers run locally, so the tested zip and the
+          # published zip are produced identically.
+          ZIP=$(./build.sh "${GITHUB_WORKSPACE}/dist")
+          echo "ZIP=${ZIP}" >> "$GITHUB_ENV"
+          unzip -l "${ZIP}"
+          echo "ZIP_SHA256=$(sha256sum "${ZIP}" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "IMAGE_SHA256=$(sha256sum nvbk/oplusstanvbk.img | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          body: |
+            Signal fix for OnePlus 13 CN (PJZ110) on OxygenOS 16.
+
+            `nvbk/oplusstanvbk.img` is the stock image from PJZ110 firmware `${{ github.ref_name }}`.
+
+            | artifact | SHA256 |
+            | --- | --- |
+            | `${{ env.ID }}-${{ github.ref_name }}.zip` | `${{ env.ZIP_SHA256 }}` |
+            | `nvbk/oplusstanvbk.img` | `${{ env.IMAGE_SHA256 }}` |
+
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md).
