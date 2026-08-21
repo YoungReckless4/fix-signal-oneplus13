@@ -32,7 +32,9 @@ jobs:
           set -euo pipefail
           # Same script developers run locally, so the tested zip and the
           # published zip are produced identically.
-          ZIP=$(./build.sh "${GITHUB_WORKSPACE}/dist")
+          # Invoked via sh so a lost executable bit cannot break the release;
+          # lint.yml separately enforces that the bit stays set in git.
+          ZIP=$(sh ./build.sh "${GITHUB_WORKSPACE}/dist")
           echo "ZIP=${ZIP}" >> "$GITHUB_ENV"
           unzip -l "${ZIP}"
           echo "ZIP_SHA256=$(sha256sum "${ZIP}" | cut -d' ' -f1)" >> "$GITHUB_ENV"

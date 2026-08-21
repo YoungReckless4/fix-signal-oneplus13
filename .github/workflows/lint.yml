@@ -24,3 +24,14 @@ jobs:
             echo "$bad"
             exit 1
           fi
+
+      # A Windows checkout has core.filemode=false, so an exec bit dropped there
+      # goes unnoticed until a release fails on the runner with exit code 126.
+      - name: Ensure build.sh keeps its executable bit
+        run: |
+          set -euo pipefail
+          mode=$(git ls-files -s build.sh | cut -d" " -f1)
+          if [ "$mode" != "100755" ]; then
+            echo "::error::build.sh is $mode in git, expected 100755"
+            exit 1
+          fi
