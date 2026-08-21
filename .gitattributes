@@ -1,0 +1,9 @@
+# Module scripts are executed by Android's sh (mksh/ash). CRLF breaks them,
+# so every text file that ships inside the flashable zip must stay LF.
+* text=auto eol=lf
+*.sh text eol=lf
+*.prop text eol=lf
+update-binary text eol=lf
+updater-script text eol=lf
+*.img binary
+*.zip binary
