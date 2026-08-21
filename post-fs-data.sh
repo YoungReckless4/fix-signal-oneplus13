@@ -14,21 +14,35 @@ LOGFILE="${MODDIR}/post-fs-data.log"
 MODFILE="${MODDIR}/nvbk/oplusstanvbk.img"
 MODFILEMOUNTED="${MODDIR}/nvbk/mounted"
 
-SLOT="$(resetprop ro.boot.slot_suffix)"
-PATH="/dev/block/bootdevice/by-name/oplusstanvbk${SLOT}"
+# resetprop is provided by Magisk/KernelSU/APatch; getprop is the AOSP fallback
+# so the module still resolves its slot under a manager that omits resetprop.
+if command -v resetprop >/dev/null 2>&1; then
+  SLOT="$(resetprop ro.boot.slot_suffix)"
+else
+  SLOT="$(getprop ro.boot.slot_suffix)"
+fi
+
+# NOTE: this used to be named PATH, which silently clobbered the shell's command
+# search path for the rest of the script. Every unqualified command below only
+# kept working because busybox standalone mode resolves applets internally.
+NVBK_PART="/dev/block/bootdevice/by-name/oplusstanvbk${SLOT}"
+
+# Keep one previous boot's log around: when signal breaks, the boot that
+# introduced the breakage is the interesting one, not the current one.
+[ -f "$LOGFILE" ] && mv -f "$LOGFILE" "${LOGFILE}.1"
 
 exec > "$LOGFILE"
 exec 2>&1
 
 echo "Slot: ${SLOT}"
 echo
-ls -laZ "$PATH"
+ls -laZ "$NVBK_PART"
 echo
-if [ -L "$PATH" ]; then
+if [ -L "$NVBK_PART" ]; then
   rm -f "$MODFILEMOUNTED"
   cp "$MODFILE" "$MODFILEMOUNTED"
 
-  ORIG="$(readlink -fn "$PATH")"
+  ORIG="$(readlink -fn "$NVBK_PART")"
   DEV="${ORIG}_mod"
 
   if [ -e "$MODFILEMOUNTED" ]; then
@@ -40,6 +54,9 @@ if [ -L "$PATH" ]; then
     # partition will solve the issue, but requires a "hack" to work.
     # We first associate our patched file with the next available loop device, then we rename it.
     # I'm not sure if it's still needed, since we don't replace '/dev/block/by-name/oplusstanvbk' anymore.
+    #
+    # losetup is called by absolute path on purpose: '-sf' is toybox syntax, and a
+    # busybox losetup earlier in PATH does not accept it.
     LOOP_DEV="$(/system/bin/losetup -sf "$MODFILEMOUNTED")"
     if [ -z "$LOOP_DEV" ]; then
       echo "ERROR: Cannot create loop device"
@@ -54,14 +71,14 @@ if [ -L "$PATH" ]; then
         ls -laZ "$DEV"
         echo
         # Create symlink to newly created loop device
-        ln -sfv "$DEV" "$PATH"
+        ln -sfv "$DEV" "$NVBK_PART"
         echo
-        ls -laZ "$PATH"
+        ls -laZ "$NVBK_PART"
       fi
     fi
   else
     echo "ERROR: ${MODFILEMOUNTED} doesn't exist!!!"
   fi
 else
-  echo "ERROR: ${PATH} doesn't exist!!!"
+  echo "ERROR: ${NVBK_PART} doesn't exist!!!"
 fi
